@@ -12,10 +12,20 @@ const config = require('@zone-eu/wild-config');
 const { ObjectId } = require('mongodb');
 const { ImapFlow } = require('imapflow');
 const { parseSearchQuery, getMongoDBQuery } = require('../../lib/search-query');
+const { prepareSearchFilter } = require('../../lib/prepare-search-filter');
 
 const server = supertest.agent(`http://127.0.0.1:${config.api.port}`);
 
 describe('Search query parser tests', function () {
+    const noDbLookup = {
+        database: {
+            collection() {
+                throw new Error('Unexpected database lookup');
+            }
+        }
+    };
+    const headerMatch = (key, regex) => ({ headers: { $elemMatch: { key, value: { $regex: regex, $options: 'i' } } } });
+
     it('should parse quoted multi-word text as an exact phrase only when quoted', () => {
         const unquoted = parseSearchQuery('phrase here');
         const quoted = parseSearchQuery('"phrase here"');
@@ -242,6 +252,138 @@ describe('Search query parser tests', function () {
             searchable: true
         });
     });
+
+    it('should tag every OR branch wrapping a $text clause with the user id', async () => {
+        const user = new ObjectId();
+
+        // MongoDB only plans an $or holding a $text clause when every branch of that $or
+        // is index backed, and the text index is prefixed with `user`
+        expect(await getMongoDBQuery(noDbLookup, user, 'from:1.1.2021 OR to:31.12.2024 example', { useAndSearch: true })).to.deep.equal({
+            user,
+            $and: [
+                {
+                    $or: [
+                        {
+                            user,
+                            ...headerMatch('from', '1\\.1\\.2021')
+                        },
+                        {
+                            user,
+                            $and: [
+                                {
+                                    $or: [headerMatch('to', '31\\.12\\.2024'), headerMatch('cc', '31\\.12\\.2024'), headerMatch('bcc', '31\\.12\\.2024')]
+                                },
+                                {
+                                    $text: {
+                                        $search: '"example"'
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            searchable: true
+        });
+    });
+
+    it('should tag OR branches on every level between the root and a $text clause', async () => {
+        const user = new ObjectId();
+        const query = await getMongoDBQuery(noDbLookup, user, 'from:sender (example OR to:rcpt) OR subject:topic', { useAndSearch: true });
+
+        const outer = query.$and[0].$or;
+        expect(outer.every(branch => branch.user === user)).to.be.true;
+
+        const inner = outer.find(branch => branch.$and).$and.find(branch => branch.$or).$or;
+        expect(inner.every(branch => branch.user === user)).to.be.true;
+        expect(inner.some(branch => branch.$text)).to.be.true;
+    });
+
+    it('should not tag OR branches when the query has no $text clause', async () => {
+        const user = new ObjectId();
+        const query = await getMongoDBQuery(noDbLookup, user, 'from:sender OR subject:topic');
+
+        expect(query.$and[0].$or.every(branch => !('user' in branch))).to.be.true;
+    });
+
+    it('should emit a single $text clause and fall back to regex for the rest', async () => {
+        const user = new ObjectId();
+        const countTextClauses = value => {
+            if (!value || typeof value !== 'object') {
+                return 0;
+            }
+            if (Array.isArray(value)) {
+                return value.reduce((sum, entry) => sum + countTextClauses(entry), 0);
+            }
+            return Object.entries(value).reduce((sum, [key, entry]) => sum + (key === '$text' ? 1 : countTextClauses(entry)), 0);
+        };
+
+        // MongoDB rejects a query holding more than one $text expression
+        for (let q of ['from:sender first OR to:rcpt second', 'first OR from:sender OR second', 'first second OR third fourth']) {
+            expect(countTextClauses(await getMongoDBQuery(noDbLookup, user, q, { useAndSearch: true }))).to.equal(1);
+        }
+    });
+
+    it('should keep AND semantics when a merged text clause falls back to regex', async () => {
+        const user = new ObjectId();
+        const query = await getMongoDBQuery(noDbLookup, user, 'first second OR third fourth', { useAndSearch: true });
+        const fallback = query.$and[0].$or[1].$and[0];
+
+        // `third fourth` was an AND of two terms before losing the $text slot
+        expect(fallback.$and).to.have.lengthOf(2);
+        expect(fallback.$or).to.be.undefined;
+    });
+
+    it('should keep negated terms excluding when a merged text clause falls back to regex', async () => {
+        const user = new ObjectId();
+        const losingBranch = async q => (await getMongoDBQuery(noDbLookup, user, q)).$and[0].$or[1].$and[0];
+
+        // $text applies a negated term as an exclusion even in OR mode, so `gamma -delta`
+        // means gamma AND NOT delta, not gamma OR NOT delta
+        const negated = await losingBranch('alpha beta OR gamma -delta');
+        expect(negated.$and).to.have.lengthOf(2);
+        expect(negated.$and[1].$nor).to.not.be.undefined;
+
+        // without a negated term the merged OR terms stay ORed
+        const plain = await losingBranch('alpha beta OR gamma delta');
+        expect(plain.$or).to.have.lengthOf(2);
+        expect(plain.$and).to.be.undefined;
+    });
+
+    it('should tag the $text branch of an or.* search filter with the user id', async () => {
+        const user = new ObjectId();
+        const db = {
+            ...noDbLookup,
+            users: {
+                collection() {
+                    return {
+                        findOne() {
+                            return Promise.resolve({ _id: user, username: 'searchuser', address: 'searchuser@example.com' });
+                        }
+                    };
+                }
+            }
+        };
+
+        const { filter } = await prepareSearchFilter(db, user, { or: { query: 'example', from: 'sender' }, useAndSearch: true });
+
+        expect(filter).to.deep.equal({
+            user,
+            searchable: true,
+            $or: [
+                {
+                    user,
+                    $text: {
+                        $search: '"example"'
+                    }
+                },
+                {
+                    user,
+                    ...headerMatch('from', 'sender')
+                }
+            ]
+        });
+    });
 });
 
 describe('Messages tests', function () {
@@ -302,9 +444,9 @@ describe('Messages tests', function () {
         altFromAddress: 'search.query.alt-from@web.zone.test'
     };
 
-    const searchQ = async q => {
+    const searchQ = async (q, params = {}) => {
         const search = await server
-            .get(`/users/${user}/search?q=${encodeURIComponent(q)}&limit=50`)
+            .get(`/users/${user}/search?${new URLSearchParams({ q, limit: 50, ...params })}`)
             .send({})
             .expect(200);
 
@@ -314,6 +456,7 @@ describe('Messages tests', function () {
         return search.body;
     };
 
+    const postQueryMessage = message => server.post(`/users/${user}/mailboxes/${queryMailbox}/messages`).send(message).expect(200);
     const getSubjects = body => body.results.map(entry => entry.subject);
     const getIds = body => body.results.map(entry => entry.id);
     const ensureMoreThanSearchableMailboxThreshold = async () => {
@@ -1498,6 +1641,101 @@ describe('Messages tests', function () {
         expect(getSubjects(search)).to.include(queryFixture.subjectAttachment);
     });
 
+    it('should GET /users/:user/search expect success / q supports mixed header and fulltext OR branches', async () => {
+        const suffix = Date.now().toString(36);
+        const senderAddress = `search.query.mixed-from-${suffix}@web.zone.test`;
+        const recipientAddress = `search.query.mixed-to-${suffix}@to.com`;
+        const bodyToken = `searchquerymixedbody${suffix}`;
+        const fromSubject = 'Search Query Mixed OR From Marker';
+        const toSubject = 'Search Query Mixed OR To Marker';
+        const decoySubject = 'Search Query Mixed OR Decoy Marker';
+
+        // matches the header branch only
+        await postQueryMessage({
+            date: new Date('2021-01-10T10:00:00.000Z'),
+            from: { address: senderAddress },
+            to: [{ address: queryFixture.otherAddress }],
+            subject: fromSubject,
+            text: 'mixed or from side'
+        });
+
+        // matches the recipient and fulltext branch
+        await postQueryMessage({
+            date: new Date('2021-01-10T11:00:00.000Z'),
+            from: { address: queryFixture.otherAddress },
+            to: [{ address: recipientAddress }],
+            subject: toSubject,
+            text: `mixed or to side ${bodyToken}`
+        });
+
+        // matches the recipient but not the fulltext term, so the AND branch must reject it
+        await postQueryMessage({
+            date: new Date('2021-01-10T12:00:00.000Z'),
+            from: { address: queryFixture.otherAddress },
+            to: [{ address: recipientAddress }],
+            subject: decoySubject,
+            text: 'mixed or decoy side'
+        });
+
+        const q = `from:${senderAddress} OR to:${recipientAddress} ${bodyToken}`;
+
+        // the same query has to plan both with and without the searchable mailbox filter
+        for (let params of [{ useAndSearch: 1 }, { useAndSearch: 1, searchable: 1 }]) {
+            const search = await searchQ(q, params);
+            const subjects = getSubjects(search);
+
+            expect(subjects).to.include(fromSubject);
+            expect(subjects).to.include(toSubject);
+            expect(subjects).to.not.include(decoySubject);
+            expect(subjects).to.not.include(queryFixture.subjectKeyword);
+        }
+    });
+
+    it('should GET /users/:user/search expect success / q supports fulltext terms in more than one OR branch', async () => {
+        const suffix = Date.now().toString(36);
+        const senderAddress = `search.query.multi-from-${suffix}@web.zone.test`;
+        const recipientAddress = `search.query.multi-to-${suffix}@to.com`;
+        const firstToken = `searchquerymultifirst${suffix}`;
+        const secondToken = `searchquerymultisecond${suffix}`;
+        const firstSubject = 'Search Query Multi Text OR First Marker';
+        const secondSubject = 'Search Query Multi Text OR Second Marker';
+        const decoySubject = 'Search Query Multi Text OR Decoy Marker';
+
+        await postQueryMessage({
+            date: new Date('2021-01-11T10:00:00.000Z'),
+            from: { address: senderAddress },
+            to: [{ address: queryFixture.otherAddress }],
+            subject: firstSubject,
+            text: `multi text first side ${firstToken}`
+        });
+
+        await postQueryMessage({
+            date: new Date('2021-01-11T11:00:00.000Z'),
+            from: { address: queryFixture.otherAddress },
+            to: [{ address: recipientAddress }],
+            subject: secondSubject,
+            text: `multi text second side ${secondToken}`
+        });
+
+        // right sender, wrong fulltext term
+        await postQueryMessage({
+            date: new Date('2021-01-11T12:00:00.000Z'),
+            from: { address: senderAddress },
+            to: [{ address: queryFixture.otherAddress }],
+            subject: decoySubject,
+            text: `multi text decoy side ${secondToken}`
+        });
+
+        // MongoDB only accepts a single $text expression, the second term falls back to regex
+        const q = `from:${senderAddress} ${firstToken} OR to:${recipientAddress} ${secondToken}`;
+        const search = await searchQ(q, { useAndSearch: 1, searchable: 1 });
+        const subjects = getSubjects(search);
+
+        expect(subjects).to.include(firstSubject);
+        expect(subjects).to.include(secondSubject);
+        expect(subjects).to.not.include(decoySubject);
+    });
+
     it('should GET /users/:user/search expect success / q supports OR between quoted from and to keywords', async () => {
         const orAddress = `search.query.or-${Date.now().toString(36)}@to.com`;
         const fromSubject = 'Search Query Quoted From OR Marker';
@@ -2151,6 +2389,337 @@ describe('Messages tests', function () {
         expect(singleThread.body.results[0]).to.not.have.property('hasDrafts');
         expect(singleThread.body.nextCursor).to.be.false;
         expect(singleThread.body.previousCursor).to.be.false;
+    });
+
+    it('should PUT and DELETE /users/:user/mailboxes/:mailbox/messages expect success / updateThread affects only the current mailbox thread', async () => {
+        const mailboxResponse = await server
+            .post(`/users/${user}/mailboxes`)
+            .send({ path: `/update-thread-${Date.now().toString(36)}`, hidden: false, retention: 10000 })
+            .expect(200);
+        const threadMailbox = mailboxResponse.body.id;
+
+        const otherMailboxResponse = await server
+            .post(`/users/${user}/mailboxes`)
+            .send({ path: `/update-thread-other-${Date.now().toString(36)}`, hidden: false, retention: 10000 })
+            .expect(200);
+        const otherMailbox = otherMailboxResponse.body.id;
+
+        const root = await server
+            .post(`/users/${user}/mailboxes/${threadMailbox}/messages`)
+            .send({
+                date: new Date('2026-03-01T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'update.thread@example.com' }],
+                subject: 'Update Thread Root',
+                text: 'Root message'
+            })
+            .expect(200);
+
+        const reply = await server
+            .post(`/users/${user}/mailboxes/${threadMailbox}/messages`)
+            .send({
+                date: new Date('2026-03-02T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'update.thread@example.com' }],
+                text: 'Reply message',
+                reference: {
+                    mailbox: threadMailbox,
+                    id: root.body.message.id,
+                    action: 'reply'
+                }
+            })
+            .expect(200);
+
+        const unrelated = await server
+            .post(`/users/${user}/mailboxes/${threadMailbox}/messages`)
+            .send({
+                date: new Date('2026-03-03T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'update.thread@example.com' }],
+                subject: 'Unrelated message',
+                text: 'Unrelated message'
+            })
+            .expect(200);
+
+        const otherMailboxReply = await server
+            .post(`/users/${user}/mailboxes/${otherMailbox}/messages`)
+            .send({
+                date: new Date('2026-03-04T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'update.thread@example.com' }],
+                text: 'Reply in another mailbox',
+                reference: {
+                    mailbox: threadMailbox,
+                    id: root.body.message.id,
+                    action: 'reply'
+                }
+            })
+            .expect(200);
+
+        const updateResponse = await server
+            .put(`/users/${user}/mailboxes/${threadMailbox}/messages/${reply.body.message.id}`)
+            .send({
+                updateThread: true,
+                seen: true,
+                flagged: true
+            })
+            .expect(200);
+
+        expect(updateResponse.body.updated).to.equal(2);
+
+        const currentMailboxListing = await server.get(`/users/${user}/mailboxes/${threadMailbox}/messages?limit=10&order=asc`).send({}).expect(200);
+        const currentMessages = new Map(currentMailboxListing.body.results.map(messageData => [messageData.id, messageData]));
+
+        expect(currentMessages.get(root.body.message.id).seen).to.be.true;
+        expect(currentMessages.get(root.body.message.id).flagged).to.be.true;
+        expect(currentMessages.get(reply.body.message.id).seen).to.be.true;
+        expect(currentMessages.get(reply.body.message.id).flagged).to.be.true;
+        expect(currentMessages.get(unrelated.body.message.id).seen).to.be.false;
+        expect(currentMessages.get(unrelated.body.message.id).flagged).to.be.false;
+
+        const otherMailboxMessage = await server
+            .get(`/users/${user}/mailboxes/${otherMailbox}/messages/${otherMailboxReply.body.message.id}`)
+            .send({})
+            .expect(200);
+
+        expect(otherMailboxMessage.body.thread).to.equal(currentMessages.get(root.body.message.id).thread);
+        expect(otherMailboxMessage.body.seen).to.be.false;
+        expect(otherMailboxMessage.body.flagged).to.be.false;
+
+        const deleteResponse = await server
+            .put(`/users/${user}/mailboxes/${threadMailbox}/messages`)
+            .send({
+                message: root.body.message.id.toString(),
+                updateThread: true,
+                deleted: true
+            })
+            .expect(200);
+
+        expect(deleteResponse.body.updated).to.equal(2);
+
+        const deletedListing = await server.get(`/users/${user}/mailboxes/${threadMailbox}/messages?limit=10&order=asc`).send({}).expect(200);
+        const deletedMessages = new Map(deletedListing.body.results.map(messageData => [messageData.id, messageData]));
+
+        expect(deletedMessages.get(root.body.message.id).deleted).to.be.true;
+        expect(deletedMessages.get(reply.body.message.id).deleted).to.be.true;
+        expect(deletedMessages.get(unrelated.body.message.id).deleted).to.be.false;
+
+        const unchangedOtherMailboxMessage = await server
+            .get(`/users/${user}/mailboxes/${otherMailbox}/messages/${otherMailboxReply.body.message.id}`)
+            .send({})
+            .expect(200);
+
+        expect(unchangedOtherMailboxMessage.body.deleted).to.be.false;
+
+        const physicalDeleteResponse = await server
+            .delete(`/users/${user}/mailboxes/${threadMailbox}/messages/${root.body.message.id}?updateThread=true`)
+            .send({})
+            .expect(200);
+
+        expect(physicalDeleteResponse.body.success).to.be.true;
+        expect(physicalDeleteResponse.body.deleted).to.equal(2);
+        expect(physicalDeleteResponse.body.errors).to.equal(0);
+
+        await server.get(`/users/${user}/mailboxes/${threadMailbox}/messages/${root.body.message.id}`).send({}).expect(404);
+        await server.get(`/users/${user}/mailboxes/${threadMailbox}/messages/${reply.body.message.id}`).send({}).expect(404);
+        await server.get(`/users/${user}/mailboxes/${threadMailbox}/messages/${unrelated.body.message.id}`).send({}).expect(200);
+
+        const remainingOtherMailboxMessage = await server
+            .get(`/users/${user}/mailboxes/${otherMailbox}/messages/${otherMailboxReply.body.message.id}`)
+            .send({})
+            .expect(200);
+
+        expect(remainingOtherMailboxMessage.body.deleted).to.be.false;
+    });
+
+    it('should PUT /users/:user/mailboxes/:mailbox/messages expect success / updateThread moves the entire thread', async () => {
+        const sourceMailboxResponse = await server
+            .post(`/users/${user}/mailboxes`)
+            .send({ path: `/move-thread-${Date.now().toString(36)}`, hidden: false, retention: 10000 })
+            .expect(200);
+        const sourceMailbox = sourceMailboxResponse.body.id;
+
+        const targetMailboxResponse = await server
+            .post(`/users/${user}/mailboxes`)
+            .send({ path: `/move-thread-target-${Date.now().toString(36)}`, hidden: false, retention: 10000 })
+            .expect(200);
+        const targetMailbox = targetMailboxResponse.body.id;
+
+        const root = await server
+            .post(`/users/${user}/mailboxes/${sourceMailbox}/messages`)
+            .send({
+                date: new Date('2026-04-01T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'move.thread@example.com' }],
+                subject: 'Move Thread Root',
+                text: 'Root message'
+            })
+            .expect(200);
+
+        const reply = await server
+            .post(`/users/${user}/mailboxes/${sourceMailbox}/messages`)
+            .send({
+                date: new Date('2026-04-02T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'move.thread@example.com' }],
+                text: 'Reply message',
+                reference: {
+                    mailbox: sourceMailbox,
+                    id: root.body.message.id,
+                    action: 'reply'
+                }
+            })
+            .expect(200);
+
+        const unrelated = await server
+            .post(`/users/${user}/mailboxes/${sourceMailbox}/messages`)
+            .send({
+                date: new Date('2026-04-03T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'move.thread@example.com' }],
+                subject: 'Unrelated move message',
+                text: 'Unrelated message'
+            })
+            .expect(200);
+
+        // move by pointing at the reply only, the root must follow along
+        const moveResponse = await server
+            .put(`/users/${user}/mailboxes/${sourceMailbox}/messages/${reply.body.message.id}`)
+            .send({
+                updateThread: true,
+                moveTo: targetMailbox
+            })
+            .expect(200);
+
+        expect(moveResponse.body.success).to.be.true;
+        expect(moveResponse.body.mailbox).to.equal(targetMailbox);
+        expect(moveResponse.body.id.length).to.equal(2);
+        expect(moveResponse.body.id.map(entry => entry[0]).sort((a, b) => a - b)).to.deep.equal(
+            [root.body.message.id, reply.body.message.id].sort((a, b) => a - b)
+        );
+
+        const sourceListing = await server.get(`/users/${user}/mailboxes/${sourceMailbox}/messages?limit=10&order=asc`).send({}).expect(200);
+        expect(sourceListing.body.results.map(entry => entry.id)).to.deep.equal([unrelated.body.message.id]);
+
+        const targetListing = await server.get(`/users/${user}/mailboxes/${targetMailbox}/messages?limit=10&order=asc`).send({}).expect(200);
+        expect(targetListing.body.results.length).to.equal(2);
+
+        const movedUids = new Map(moveResponse.body.id);
+        for (const [sourceUid, destinationUid] of movedUids) {
+            expect(sourceUid).to.be.a('number');
+            const movedMessage = await server.get(`/users/${user}/mailboxes/${targetMailbox}/messages/${destinationUid}`).send({}).expect(200);
+            expect(movedMessage.body.success).to.be.true;
+        }
+    });
+
+    it('should DELETE /users/:user/mailboxes/:mailbox/messages/:message expect success / updateThread keeps pulled in drafts restorable', async () => {
+        const mailboxResponse = await server
+            .post(`/users/${user}/mailboxes`)
+            .send({ path: `/delete-thread-${Date.now().toString(36)}`, hidden: false, retention: 10000 })
+            .expect(200);
+        const draftMailbox = mailboxResponse.body.id;
+
+        const root = await server
+            .post(`/users/${user}/mailboxes/${draftMailbox}/messages`)
+            .send({
+                date: new Date('2026-05-01T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'delete.thread@example.com' }],
+                subject: 'Delete Thread Root',
+                text: 'Root message'
+            })
+            .expect(200);
+
+        // uploading with a reference always marks the message as a draft
+        const draftReply = await server
+            .post(`/users/${user}/mailboxes/${draftMailbox}/messages`)
+            .send({
+                date: new Date('2026-05-02T00:00:00.000Z'),
+                unseen: true,
+                to: [{ address: 'delete.thread@example.com' }],
+                text: 'Unsent reply',
+                reference: {
+                    mailbox: draftMailbox,
+                    id: root.body.message.id,
+                    action: 'reply'
+                }
+            })
+            .expect(200);
+
+        const draftMessage = await server.get(`/users/${user}/mailboxes/${draftMailbox}/messages/${draftReply.body.message.id}`).send({}).expect(200);
+        expect(draftMessage.body.draft).to.be.true;
+        const thread = draftMessage.body.thread;
+
+        const deleteResponse = await server
+            .delete(`/users/${user}/mailboxes/${draftMailbox}/messages/${root.body.message.id}?updateThread=true`)
+            .send({})
+            .expect(200);
+
+        expect(deleteResponse.body.deleted).to.equal(2);
+        expect(deleteResponse.body.errors).to.equal(0);
+
+        const archived = await server.get(`/users/${user}/archived/messages?limit=250`).send({}).expect(200);
+        const archivedThread = archived.body.results.filter(entry => entry.thread === thread);
+
+        // the draft was not asked for by uid, deleting it as a thread sibling must not destroy it
+        expect(archivedThread.length).to.equal(2);
+        expect(archivedThread.some(entry => entry.draft)).to.be.true;
+    });
+
+    it('should DELETE /users/:user/mailboxes/:mailbox/messages/:message expect success / a directly deleted draft is not archived', async () => {
+        const mailboxResponse = await server
+            .post(`/users/${user}/mailboxes`)
+            .send({ path: `/delete-draft-${Date.now().toString(36)}`, hidden: false, retention: 10000 })
+            .expect(200);
+        const draftMailbox = mailboxResponse.body.id;
+
+        const draft = await server
+            .post(`/users/${user}/mailboxes/${draftMailbox}/messages`)
+            .send({
+                date: new Date('2026-06-01T00:00:00.000Z'),
+                draft: true,
+                unseen: true,
+                to: [{ address: 'delete.draft@example.com' }],
+                subject: 'Standalone Draft',
+                text: 'Standalone draft'
+            })
+            .expect(200);
+
+        const draftMessage = await server.get(`/users/${user}/mailboxes/${draftMailbox}/messages/${draft.body.message.id}`).send({}).expect(200);
+        const thread = draftMessage.body.thread;
+
+        const deleteResponse = await server.delete(`/users/${user}/mailboxes/${draftMailbox}/messages/${draft.body.message.id}`).send({}).expect(200);
+
+        expect(deleteResponse.body.deleted).to.equal(1);
+        expect(deleteResponse.body.errors).to.equal(0);
+
+        const archived = await server.get(`/users/${user}/archived/messages?limit=250`).send({}).expect(200);
+        expect(archived.body.results.filter(entry => entry.thread === thread).length).to.equal(0);
+    });
+
+    it('should DELETE /users/:user/mailboxes/:mailbox/messages/:message expect failure / unknown message with updateThread', async () => {
+        const response = await server.delete(`/users/${user}/mailboxes/${testMailbox}/messages/1000000?updateThread=true`).send({}).expect(404);
+
+        expect(response.body.error).to.exist;
+        expect(response.body.code).to.equal('MessageNotFound');
+    });
+
+    it('should DELETE /users/:user/mailboxes/:mailbox/messages/:message expect failure / unknown mailbox', async () => {
+        const response = await server.delete(`/users/${user}/mailboxes/${new ObjectId().toString()}/messages/1`).send({}).expect(404);
+
+        expect(response.body.code).to.equal('NoSuchMailbox');
+    });
+
+    it('should PUT /users/:user/mailboxes/:mailbox/messages expect failure / updateThread with per message values', async () => {
+        for (const payload of [{ metaData: { tag: 'value' } }, { expires: new Date('2030-01-01T00:00:00.000Z') }, { draft: true }]) {
+            const response = await server
+                .put(`/users/${user}/mailboxes/${testMailbox}/messages/1`)
+                .send(Object.assign({ updateThread: true, seen: true }, payload))
+                .expect(400);
+
+            expect(response.body.code).to.equal('InputValidationError');
+            expect(response.body.error).to.include('updateThread');
+        }
     });
 
     it('should PUT /users/:user/mailboxes/:mailbox/messages expect success / move lots of messages to trash, should not timeout', async () => {
