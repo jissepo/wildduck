@@ -29,17 +29,21 @@ function durationSeconds(start) {
     return diff[0] + diff[1] / 1e9;
 }
 
+function setHeaders(res, headers) {
+    Object.keys(headers || {}).forEach(key => res.setHeader(key, headers[key]));
+}
+
 function sendText(res, statusCode, body, headers) {
     res.statusCode = statusCode;
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    Object.keys(headers || {}).forEach(key => res.setHeader(key, headers[key]));
+    setHeaders(res, headers);
     res.end(body);
 }
 
 function sendJson(res, statusCode, body, headers) {
     res.statusCode = statusCode;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    Object.keys(headers || {}).forEach(key => res.setHeader(key, headers[key]));
+    setHeaders(res, headers);
     res.end(JSON.stringify(body));
 }
 
@@ -92,13 +96,76 @@ function applyCors(req, res) {
     res.setHeader('Access-Control-Expose-Headers', 'MCP-Protocol-Version, MCP-Session-Id');
 }
 
-function getBearerToken(req) {
-    let authorization = req.headers.authorization;
-    if (Array.isArray(authorization) || typeof authorization !== 'string') {
-        return false;
+// A refused request whose body is still arriving cannot be answered on a connection the client
+// can read: the receive buffer fills, the client blocks writing, and a close issued before the
+// body is off the wire reaches the client as a reset rather than as the status. So the body is
+// read and discarded first, then the status is sent on a connection that is still readable.
+//
+// The drain is bounded, by bytes and by time, so a body many times the size limit, or one
+// trickled to hold the connection open, is cut off instead: that caller gets a reset, which is
+// the right answer for it. Draining discards rather than buffers, so memory stays bounded
+// whatever the bound is; the bound is there to cap bandwidth and time, not memory.
+const MAX_UNREAD_DRAIN = 4 * 1024 * 1024;
+const MAX_UNREAD_DRAIN_MS = 5 * 1000;
+
+/**
+ * Reads and discards whatever is left of a request body, so a refusal reaches the client
+ * instead of racing a socket teardown.
+ *
+ * @param {Object} req Node request.
+ * @param {Number} maxBytes Report failure once this many bytes have been discarded.
+ * @param {Number} maxMs Report failure once this long has passed.
+ * @returns {Promise<Boolean>} True when the body ended within the bound, so a refusal may be
+ *   sent on a reusable connection; false when the bound was hit or the stream was already gone,
+ *   so the caller must close the connection.
+ */
+function drainUnusedBody(req, maxBytes, maxMs) {
+    if (req.complete) {
+        // nothing left on the wire, so the connection stays reusable
+        return Promise.resolve(true);
     }
-    let match = authorization.match(/^Bearer ([^\s]+)$/i);
-    return match ? match[1] : false;
+    if (req.destroyed || !req.readable) {
+        // the stream is gone (for example readBody threw part way through a chunked body), so
+        // there is no clean way to finish the read and the connection has to close
+        return Promise.resolve(false);
+    }
+    return new Promise(resolve => {
+        let drained = 0;
+        let settled = false;
+        let onData;
+        let onEnd;
+        let onError;
+        let timer;
+
+        let finish = ok => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            req.removeListener('data', onData);
+            req.removeListener('end', onEnd);
+            req.removeListener('error', onError);
+            req.removeListener('aborted', onError);
+            resolve(ok);
+        };
+
+        onData = chunk => {
+            drained += chunk.length;
+            if (drained > maxBytes) {
+                finish(false);
+            }
+        };
+        onEnd = () => finish(true);
+        onError = () => finish(false);
+        timer = setTimeout(() => finish(false), maxMs);
+
+        req.on('data', onData);
+        req.on('end', onEnd);
+        req.on('error', onError);
+        req.on('aborted', onError);
+        req.resume();
+    });
 }
 
 /**
@@ -107,6 +174,10 @@ function getBearerToken(req) {
  * The body is consumed here whether or not the request has a use for one, because the protocol
  * handler reads the stream itself and buffers all of it before answering. Leaving the stream
  * untouched for a method that carries no payload would hand that method an unbounded read.
+ *
+ * An oversized body is refused without reading it. What is left of it is taken off the wire by
+ * the caller through `drainUnusedBody` before the refusal is sent, so the client reads the
+ * status rather than a reset; a body that overruns that drain is cut instead.
  *
  * @param {Object} req Node request.
  * @param {Number} maxSize Maximum body size in bytes.
@@ -121,7 +192,6 @@ async function readBody(req, maxSize) {
 
     let contentLength = Number(req.headers['content-length']);
     if (Number.isFinite(contentLength) && contentLength > maxSize) {
-        req.resume();
         let err = new Error('Request body is too large');
         err.statusCode = 413;
         throw err;
@@ -298,38 +368,79 @@ function createRequestListener(options, dependencies) {
         res.once('finish', record);
         res.once('close', record);
 
+        // Reads and discards the request body, when there is one left, before an early response.
+        let drain = () => drainUnusedBody(req, MAX_UNREAD_DRAIN, MAX_UNREAD_DRAIN_MS);
+
+        /**
+         * Writes an early response for a request whose body may not have been read.
+         *
+         * When the body drained cleanly the answer goes out on a reusable connection; when it
+         * overran the drain bound the answer is sent with a close and the socket is cut, since
+         * the rest cannot be delivered cleanly and its sender does not get to hold the connection
+         * open. That close-and-cut decision lives here alone, so an early exit added later cannot
+         * answer a partly read request without it.
+         *
+         * @param {Boolean} drained Result of `drain`, whether the body was fully taken off the wire.
+         * @param {Function} send Response writer, `(res, statusCode, body, headers)`.
+         * @param {Number} statusCode HTTP status code.
+         * @param {*} body Response body, as the writer expects it.
+         * @param {Object} [headers] Extra response headers.
+         */
+        let finish = (drained, send, statusCode, body, headers) => {
+            if (drained) {
+                return send(res, statusCode, body, headers);
+            }
+            send(res, statusCode, body, { Connection: 'close', ...headers });
+            if (req.socket && !req.socket.destroyed) {
+                req.socket.destroy();
+            }
+        };
+
+        // Sends a body-less response (used for the OPTIONS preflight, which forces no content type).
+        let sendEmpty = (target, statusCode, body, headers) => {
+            target.statusCode = statusCode;
+            setHeaders(target, headers);
+            target.end();
+        };
+
+        // Every early refusal drains first, then answers through `finish`, so the drain-and-cut
+        // rule is applied in one place rather than repeated at each site. Together with the cap
+        // in `readBody` it means no request makes this listener read more than a bounded amount.
+        let refuse = async (send, statusCode, body, headers) => finish(await drain(), send, statusCode, body, headers);
+
+        let text = (statusCode, body, headers) => refuse(sendText, statusCode, body, headers);
+        let json = (statusCode, body, headers) => refuse(sendJson, statusCode, body, headers);
+
         let pathname;
         try {
             pathname = new URL(req.url || '/', 'http://localhost').pathname;
         } catch (err) {
-            return sendText(res, 400, 'Bad Request\n');
+            return text(400, 'Bad Request\n');
         }
 
         if (pathname !== expectedPath) {
-            return sendText(res, 404, 'Not Found\n');
+            return text(404, 'Not Found\n');
         }
         if (!validateHost(req, allowedHosts)) {
-            return sendText(res, 403, 'Forbidden\n');
+            return text(403, 'Forbidden\n');
         }
         if (!validateOrigin(req, options)) {
-            return sendText(res, 403, 'Forbidden\n');
+            return text(403, 'Forbidden\n');
         }
         applyCors(req, res);
 
         if (req.method === 'OPTIONS') {
-            res.statusCode = 204;
-            res.setHeader('Access-Control-Allow-Methods', 'POST, GET, DELETE, OPTIONS');
-            res.setHeader(
-                'Access-Control-Allow-Headers',
-                'Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, MCP-Param-Name, MCP-Param-Task-Id, MCP-Param-Cursor'
-            );
-            return res.end();
+            return finish(await drain(), sendEmpty, 204, null, {
+                'Access-Control-Allow-Methods': 'POST, GET, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers':
+                    'Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, MCP-Param-Name, MCP-Param-Task-Id, MCP-Param-Cursor'
+            });
         }
         if (!MCP_METHODS.has(req.method)) {
-            return sendText(res, 405, 'Method Not Allowed\n', { Allow: 'POST, GET, DELETE, OPTIONS' });
+            return text(405, 'Method Not Allowed\n', { Allow: 'POST, GET, DELETE, OPTIONS' });
         }
 
-        let token = getBearerToken(req);
+        let token = McpTokenHandler.getBearerToken(req.headers.authorization);
         let authenticated;
         try {
             authenticated = await dependencies.tokenHandler.authenticate(token, { ip: remoteAddress(req, options) });
@@ -337,19 +448,18 @@ function createRequestListener(options, dependencies) {
         } catch (err) {
             if (err && err.code === 'RateLimitedError') {
                 metrics.recordAuthAttempt('mcp', MCP_TOKEN_AUDIENCE, 'ratelimited');
-                return sendJson(res, 429, { jsonrpc: '2.0', error: { code: -32002, message: 'Too many failed attempts' }, id: null });
+                return json(429, { jsonrpc: '2.0', error: { code: -32002, message: 'Too many failed attempts' }, id: null });
             }
             if (!err || err.code !== 'InvalidMcpToken') {
                 metrics.recordAuthAttempt('mcp', MCP_TOKEN_AUDIENCE, 'error');
-                return sendJson(res, 503, {
+                return json(503, {
                     jsonrpc: '2.0',
                     error: { code: -32603, message: 'Authentication service unavailable' },
                     id: null
                 });
             }
             metrics.recordAuthAttempt('mcp', MCP_TOKEN_AUDIENCE, 'fail');
-            return sendJson(
-                res,
+            return json(
                 401,
                 {
                     jsonrpc: '2.0',
@@ -379,26 +489,31 @@ function createRequestListener(options, dependencies) {
         if (req.method !== 'GET') {
             try {
                 // Only POST carries a JSON-RPC message. A DELETE body is read to keep it under
-                // the cap and to leave the stream consumed, then discarded unparsed. GET is
-                // skipped because a web-standard Request carries no body for it, so the
-                // protocol handler never reads one and an unread body stays in the socket
-                // buffer under backpressure.
+                // the cap and to leave the stream consumed, then discarded unparsed.
                 let body = await readBody(req, maxRequestSize);
                 if (req.method === 'POST') {
                     parsedBody = parseJsonBody(body);
                 }
             } catch (err) {
                 if (err.statusCode === 413) {
-                    return sendText(res, 413, 'Payload Too Large\n');
+                    return text(413, 'Payload Too Large\n');
                 }
                 if (err.statusCode === 415) {
-                    return sendText(res, 415, 'Unsupported Media Type\n');
+                    return text(415, 'Unsupported Media Type\n');
                 }
-                return sendJson(res, 400, {
+                return json(400, {
                     jsonrpc: '2.0',
                     error: { code: -32700, message: 'Parse error' },
                     id: null
                 });
+            }
+        } else if (!req.complete) {
+            // A GET carries no JSON-RPC message, so the protocol handler never reads one and an
+            // unread body would sit in the socket buffer to be dumped onto the next request.
+            // Drain it under the same bound; a body that overruns the bound is refused rather
+            // than handed off.
+            if (!(await drain())) {
+                return finish(false, sendText, 413, 'Payload Too Large\n');
             }
         }
 
@@ -415,7 +530,9 @@ function createServer(options, dependencies) {
         listener(req, res).catch(() => {
             log.error('MCP', 'Unhandled request failure');
             if (!res.headersSent) {
-                return sendText(res, 500, 'Internal Server Error\n');
+                // Nothing here knows how much of the request was read, so the conservative
+                // answer is the one that cannot leave a body behind
+                return sendText(res, 500, 'Internal Server Error\n', { Connection: 'close' });
             }
             res.end();
         });
@@ -496,4 +613,5 @@ module.exports = done => start(config.mcp || {}, done);
 module.exports.createRequestListener = createRequestListener;
 module.exports.createServer = createServer;
 module.exports.start = start;
+module.exports.drainUnusedBody = drainUnusedBody;
 module.exports.SERVER_INSTRUCTIONS = SERVER_INSTRUCTIONS;
