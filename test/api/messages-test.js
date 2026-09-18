@@ -2391,7 +2391,7 @@ describe('Messages tests', function () {
         expect(singleThread.body.previousCursor).to.be.false;
     });
 
-    it('should PUT and DELETE /users/:user/mailboxes/:mailbox/messages expect success / updateThread affects only the current mailbox thread', async () => {
+    it('should PUT and DELETE /users/:user/mailboxes/:mailbox/messages expect success / updateThreadAll broadens updateThread to all mailboxes', async () => {
         const mailboxResponse = await server
             .post(`/users/${user}/mailboxes`)
             .send({ path: `/update-thread-${Date.now().toString(36)}`, hidden: false, retention: 10000 })
@@ -2485,6 +2485,45 @@ describe('Messages tests', function () {
         expect(otherMailboxMessage.body.thread).to.equal(currentMessages.get(root.body.message.id).thread);
         expect(otherMailboxMessage.body.seen).to.be.false;
         expect(otherMailboxMessage.body.flagged).to.be.false;
+
+        const ignoredAllMailboxUpdateResponse = await server
+            .put(`/users/${user}/mailboxes/${threadMailbox}/messages/${root.body.message.id}`)
+            .send({
+                updateThreadAll: true,
+                seen: false,
+                flagged: false
+            })
+            .expect(200);
+
+        expect(ignoredAllMailboxUpdateResponse.body.updated).to.equal(1);
+
+        const unchangedThreadReply = await server
+            .get(`/users/${user}/mailboxes/${threadMailbox}/messages/${reply.body.message.id}`)
+            .send({})
+            .expect(200);
+
+        expect(unchangedThreadReply.body.seen).to.be.true;
+        expect(unchangedThreadReply.body.flagged).to.be.true;
+
+        const allMailboxUpdateResponse = await server
+            .put(`/users/${user}/mailboxes/${threadMailbox}/messages/${root.body.message.id}`)
+            .send({
+                updateThread: true,
+                updateThreadAll: true,
+                seen: true,
+                flagged: true
+            })
+            .expect(200);
+
+        expect(allMailboxUpdateResponse.body.updated).to.equal(3);
+
+        const updatedOtherMailboxMessage = await server
+            .get(`/users/${user}/mailboxes/${otherMailbox}/messages/${otherMailboxReply.body.message.id}`)
+            .send({})
+            .expect(200);
+
+        expect(updatedOtherMailboxMessage.body.seen).to.be.true;
+        expect(updatedOtherMailboxMessage.body.flagged).to.be.true;
 
         const deleteResponse = await server
             .put(`/users/${user}/mailboxes/${threadMailbox}/messages`)
@@ -2722,6 +2761,16 @@ describe('Messages tests', function () {
         }
     });
 
+    it('should PUT /users/:user/mailboxes/:mailbox/messages expect failure / updateThreadAll with moveTo', async () => {
+        const response = await server
+            .put(`/users/${user}/mailboxes/${testMailbox}/messages/1`)
+            .send({ updateThread: true, updateThreadAll: true, moveTo: trashId })
+            .expect(400);
+
+        expect(response.body.code).to.equal('InputValidationError');
+        expect(response.body.error).to.include('updateThreadAll');
+    });
+
     it('should PUT /users/:user/mailboxes/:mailbox/messages expect success / move lots of messages to trash, should not timeout', async () => {
         const performanceMessages = [];
         // add even more messages
@@ -2769,7 +2818,7 @@ describe('Messages tests', function () {
     });
 });
 
-describe('Collapsed thread seen state', function () {
+describe('Collapsed thread state', function () {
     this.timeout(20000); // eslint-disable-line no-invalid-this
 
     let user;
@@ -2809,8 +2858,8 @@ describe('Collapsed thread seen state', function () {
         root = await append(mailbox, 1, { subject: 'Thread with an unseen middle message' });
         middle = await append(mailbox, 2, { unseen: true, reference: { mailbox, id: root, action: 'reply' } });
         latest = await append(mailbox, 3, { draft: true, reference: { mailbox, id: middle, action: 'reply' } });
-        // This unread message must not affect a listing restricted to the inbox.
-        await append(drafts, 4, { unseen: true, reference: { mailbox, id: root, action: 'reply' } });
+        // Thread metadata includes messages in other mailboxes.
+        await append(drafts, 4, { unseen: true, flagged: true, reference: { mailbox, id: root, action: 'reply' } });
         single = await append(mailbox, 5, { subject: 'Separate seen thread' });
     });
 
@@ -2839,9 +2888,11 @@ describe('Collapsed thread seen state', function () {
             const thread = response.body.results.find(entry => entry.id === (order === 'asc' ? root : latest));
             expect(thread).to.exist;
             expect(thread.seen).to.be.false;
+            expect(thread.flagged).to.be.true;
             expect(thread.hasDrafts).to.be.true;
             expect(thread).to.not.have.property('threadMessageCount');
             expect(response.body.results.find(entry => entry.id === single).seen).to.be.true;
+            expect(response.body.results.find(entry => entry.id === single).flagged).to.be.false;
         });
     }
 
@@ -2855,6 +2906,7 @@ describe('Collapsed thread seen state', function () {
         const next = await server.get(path).query({ ...query, next: first.body.nextCursor }).expect(200);
         expect(next.body.results[0].id).to.equal(latest);
         expect(next.body.results[0].seen).to.be.false;
+        expect(next.body.results[0].flagged).to.be.true;
         expect(next.body.results[0].threadMessageCount).to.equal(4);
         expect(next.body.results[0]).to.not.have.property('hasDrafts');
         expect(next.body.nextCursor).to.be.false;
@@ -2871,6 +2923,7 @@ describe('Collapsed thread seen state', function () {
 
         expect(response.body.results.map(entry => entry.id)).to.deep.equal([root, middle, latest, single]);
         expect(response.body.results.map(entry => entry.seen)).to.deep.equal([true, false, true, true]);
+        expect(response.body.results.map(entry => entry.flagged)).to.deep.equal([false, false, false, false]);
         expect(response.body.results.map(entry => entry.hasDrafts)).to.deep.equal([true, true, false, false]);
     });
 
@@ -2884,12 +2937,12 @@ describe('Collapsed thread seen state', function () {
                     .expect(200);
 
                 expect(response.body.results.map(entry => entry.id)).to.deep.equal(unseen ? [middle] : [single, latest]);
-                expect(response.body.results.every(entry => entry.seen === !unseen), `${path}, unseen=${unseen}`).to.be.true;
+                expect(response.body.results.map(entry => entry.seen), `${path}, unseen=${unseen}`).to.deep.equal(unseen ? [false] : [true, false]);
             }
         }
     });
 
-    it('should GET /users/:user/search expect success / marking the middle message seen clears unread state only in its mailbox', async () => {
+    it('should GET /users/:user/search expect success / unread thread state includes messages in other mailboxes', async () => {
         await server.put(`/users/${user}/mailboxes/${mailbox}/messages/${middle}`).send({ seen: true }).expect(200);
 
         for (const path of [`/users/${user}/mailboxes/${mailbox}/messages`, `/users/${user}/search`]) {
@@ -2899,11 +2952,13 @@ describe('Collapsed thread seen state', function () {
                 .expect(200);
 
             expect(response.body.results.map(entry => entry.id)).to.deep.equal([single, latest]);
-            expect(response.body.results.every(entry => entry.seen)).to.be.true;
+            expect(response.body.results.map(entry => entry.seen)).to.deep.equal([true, false]);
+            expect(response.body.results.map(entry => entry.flagged)).to.deep.equal([false, true]);
             expect(response.body.results[1].hasDrafts).to.be.true;
         }
 
         const response = await server.get(`/users/${user}/search`).query({ collapseThreads: true, includeHasDrafts: true }).expect(200);
         expect(response.body.results.find(entry => entry.id !== single).seen).to.be.false;
+        expect(response.body.results.find(entry => entry.id !== single).flagged).to.be.true;
     });
 });
